@@ -14,10 +14,12 @@ Biến môi trường:
   DRY_RUN=1          chỉ in ra màn hình, không đăng    (để thử)
 """
 
+import html
 import json
 import os
 import re
 import time
+from urllib.parse import urljoin
 from datetime import datetime, timezone
 
 import feedparser
@@ -32,6 +34,8 @@ BASIC_MODE_REDDIT_SCORE = 3000  # chế độ cơ bản (không AI): ngưỡng c
 MAX_CANDIDATES = 40
 STATE_FILE = "state.json"
 UA = "GTA6VietNamNewsBot/1.0 (Discord news bot)"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 GNEWS = "https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 NEWS_FEEDS = [
@@ -67,6 +71,18 @@ def save_state(state):
 
 
 # ─────────────────────────── LẤY TIN ───────────────────────────
+def reddit_image(p):
+    # Bài gắn nhãn leak thì không lấy ảnh (luật server: không đăng file leak)
+    if "leak" in (p.get("link_flair_text") or "").lower():
+        return None
+    if p.get("post_hint") == "image" and p.get("url_overridden_by_dest"):
+        return p["url_overridden_by_dest"]
+    try:
+        return html.unescape(p["preview"]["images"][0]["source"]["url"])
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 def fetch_reddit():
     try:
         r = requests.get("https://www.reddit.com/r/GTA6/top.json",
@@ -88,8 +104,10 @@ def fetch_reddit():
             "url": "https://www.reddit.com" + p["permalink"],
             "source": "Reddit r/GTA6",
             "score": p.get("score", 0),
+            "comments": p.get("num_comments", 0),
             "flair": p.get("link_flair_text") or "",
             "snippet": (p.get("selftext") or "")[:300],
+            "image": reddit_image(p),
         })
     return items
 
@@ -105,11 +123,15 @@ def fetch_news():
             continue
         for e in feedparser.parse(r.content).entries:
             source = getattr(e, "source", {}).get("title", "Google News")
+            title = e.title
+            # Google News gắn " - Tên báo" vào cuối tiêu đề, bỏ đi cho gọn
+            if title.endswith(" - " + source):
+                title = title[: -len(" - " + source)]
             items.append({
                 "id": "news_" + (e.get("id") or e.link),
                 "kind": "news",
                 "lang": lang,
-                "title": e.title,
+                "title": title,
                 "url": e.link,
                 "source": source,
                 "score": 0,
@@ -179,18 +201,68 @@ def basic_select(candidates):
     picks = []
     for c in reddit[:2]:
         picks.append({**c, "channel": "rumor", "title_vi": c["title"],
-                      "summary_vi": f"🔥 {c['score']:,} upvote trên Reddit", "hot": 0})
+                      "summary_vi": c.get("snippet", ""), "hot": 0})
     for c in news_vi[:1]:
         picks.append({**c, "channel": "official", "title_vi": c["title"],
                       "summary_vi": "", "hot": 0})
     return picks[:MAX_POSTS_PER_RUN]
 
 
+# ─────────────────────────── LÀM ĐẸP TIN ───────────────────────────
+def resolve_url(url):
+    """Link Google News là link chuyển hướng → đổi về link bài báo thật."""
+    if "news.google.com" not in url:
+        return url
+    try:
+        from googlenewsdecoder import gnewsdecoder
+        res = gnewsdecoder(url, interval=1)
+        if res.get("status"):
+            return res["decoded_url"]
+    except Exception as e:
+        print(f"! Không giải mã được link Google News: {e}")
+    return url
+
+
+def meta(page, name):
+    tag = re.search(r'<meta[^>]+(?:property|name)=["\']%s["\'][^>]*>' % re.escape(name),
+                    page, re.I)
+    if not tag:
+        return None
+    content = re.search(r'content=["\']([^"\']+)["\']', tag.group(0), re.I)
+    return html.unescape(content.group(1)).strip() if content else None
+
+
+def enrich(item):
+    """Lấy ảnh bìa + đoạn mô tả từ bài báo gốc (không được thì bỏ qua)."""
+    if item["kind"] != "news":
+        return
+    url = resolve_url(item["url"])
+    if "news.google.com" in url:
+        return
+    item["url"] = url
+    try:
+        r = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"! Không đọc được bài gốc: {e}")
+        return
+    page = r.text[:400000]
+    img = meta(page, "og:image") or meta(page, "twitter:image")
+    if img:
+        item["image"] = urljoin(r.url, img)
+    desc = meta(page, "og:description") or meta(page, "description")
+    if desc:
+        item["og_desc"] = desc if len(desc) <= 350 else desc[:347].rsplit(" ", 1)[0] + "…"
+
+
 # ─────────────────────────── ĐĂNG LÊN DISCORD ───────────────────────────
+LABELS = {"official": "📰 TIN CHÍNH THỨC", "rumor": "🕵️ TIN ĐỒN • CỘNG ĐỒNG"}
+
+
 def post_to_discord(item):
     channel = item.get("channel", "rumor")
     title = item["title_vi"]
-    desc = item.get("summary_vi", "")
+    desc = item.get("summary_vi") or item.get("og_desc") or ""
     if item.get("spoiler"):
         title = "⚠️ [CÓ SPOIL] " + title
         desc = f"||{desc}||" if desc else ""
@@ -198,6 +270,7 @@ def post_to_discord(item):
     if item.get("hot"):
         footer += f" • 🔥 Độ hot {item['hot']}/10"
     embed = {
+        "author": {"name": LABELS.get(channel, "📰 TIN GTA 6")},
         "title": title[:256],
         "url": item["url"],
         "description": desc[:4000],
@@ -205,6 +278,14 @@ def post_to_discord(item):
         "footer": {"text": footer},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    # Tin có spoil thì không gắn ảnh, tránh lộ nội dung
+    if item.get("image") and not item.get("spoiler"):
+        embed["image"] = {"url": item["image"]}
+    if item["kind"] == "reddit":
+        embed["fields"] = [
+            {"name": "🔺 Upvote", "value": f"{item['score']:,}", "inline": True},
+            {"name": "💬 Bình luận", "value": f"{item.get('comments', 0):,}", "inline": True},
+        ]
     if DRY_RUN:
         print(f"[DRY RUN → {channel}] {json.dumps(embed, ensure_ascii=False)}")
         return
@@ -250,6 +331,7 @@ def main():
             picks = basic_select(candidates)
 
         for item in picks:
+            enrich(item)
             post_to_discord(item)
             state["recent_titles"].append(item["title_vi"])
             print(f"+ Đã đăng: {item['title_vi']}")
