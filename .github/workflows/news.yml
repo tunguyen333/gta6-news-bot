@@ -1,0 +1,39 @@
+name: GTA 6 News Bot
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 30 phút một lần (GitHub có thể trễ vài phút)
+  workflow_dispatch:          # cho phép bấm chạy tay để thử
+
+permissions:
+  contents: write             # để lưu file state.json (nhớ tin đã đăng)
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Chạy bot
+        run: python news_bot.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WEBHOOK_OFFICIAL: ${{ secrets.WEBHOOK_OFFICIAL }}
+          WEBHOOK_RUMOR: ${{ secrets.WEBHOOK_RUMOR }}
+
+      - name: Lưu tin đã đăng
+        run: |
+          git config user.name "gta6-news-bot"
+          git config user.email "gta6-news-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "Cập nhật tin đã đăng" && git push)
